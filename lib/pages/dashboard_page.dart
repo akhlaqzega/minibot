@@ -1,12 +1,19 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import '../auth/auth_service.dart';
 import '../auth/login_screen.dart';
+import '../theme/theme_service.dart';
+import 'history_page.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Gemini API Config — Ganti dengan API Key Anda dari Google AI Studio
@@ -22,15 +29,7 @@ const _systemPrompt   =
 // ─────────────────────────────────────────────────────────────────────────────
 // Cyberpunk / Dark SCADA Palette
 // ─────────────────────────────────────────────────────────────────────────────
-const _bgDeep     = Color(0xFF0D0E15);
-const _bgCard     = Color(0xFF12131E);
-const _bgButton   = Color(0xFF161722);
-const _neonBlue   = Color(0xFF00D4FF);
-const _neonGreen  = Color(0xFF00FF9C);
-const _neonOrange = Color(0xFFFF6B35);
-const _neonRed    = Color(0xFFFF2D55);
-const _neonYellow = Color(0xFFFFD60A);
-const _dimText    = Color(0xFF6E7191);
+
 
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
@@ -40,6 +39,17 @@ class DashboardPage extends StatefulWidget {
 }
 
 class _DashboardPageState extends State<DashboardPage> {
+  // ── Getter Warna Dinamis untuk Tema & Warna Neon ──
+  Color get _bgDeep => ThemeService.instance.isDark ? const Color(0xFF0D0E15) : const Color(0xFFF4F5F9);
+  Color get _bgCard => ThemeService.instance.isDark ? const Color(0xFF12131E) : Colors.white;
+  Color get _bgButton => ThemeService.instance.isDark ? const Color(0xFF161722) : const Color(0xFFE8EAF6);
+  Color get _neonBlue => ThemeService.instance.primaryColor;
+  Color get _neonGreen => ThemeService.instance.isDark ? const Color(0xFF00FF9C) : const Color(0xFF00B876);
+  Color get _neonOrange => ThemeService.instance.isDark ? const Color(0xFFFF6B35) : const Color(0xFFE05315);
+  Color get _neonRed => ThemeService.instance.isDark ? const Color(0xFFFF2D55) : const Color(0xFFD31F41);
+  Color get _neonYellow => ThemeService.instance.isDark ? const Color(0xFFFFD60A) : const Color(0xFFC09000);
+  Color get _dimText => ThemeService.instance.isDark ? const Color(0xFF6E7191) : const Color(0xFF8C90B0);
+
   MqttServerClient? _client;
   bool _isConnected = false;
   String _robotStatus = "Disconnected dari MQTT Broker";
@@ -48,6 +58,12 @@ class _DashboardPageState extends State<DashboardPage> {
   String _currentEmotion  = "normal";
   int    _currentDistance = 0;
   int    _currentSignal   = 0;
+
+  // ── Telemetry Throttling State untuk Firestore ─────────────────────────────
+  String?   _lastSavedEmotion;
+  int?      _lastSavedDistance;
+  int?      _lastSavedSignal;
+  DateTime? _lastSavedTime;
 
   final String _broker           = "test.mosquitto.org";
   final String _topic            = "minibot/trkj/zega";
@@ -147,6 +163,7 @@ class _DashboardPageState extends State<DashboardPage> {
               _currentDistance = ((data['jarak']  ?? _currentDistance) as num).toInt();
               _currentSignal   = ((data['sinyal'] ?? _currentSignal)   as num).toInt();
             });
+            _saveTelemetryToFirestore(_currentDistance, _currentSignal, _currentEmotion);
           } catch (_) {
             // Payload bukan JSON (misal ACK string biasa) — abaikan saja
             debugPrint("Payload bukan JSON, diabaikan: $payloadString");
@@ -206,17 +223,17 @@ class _DashboardPageState extends State<DashboardPage> {
       builder: (ctx) => AlertDialog(
         backgroundColor: _bgCard,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
+        title: Row(
           children: [
             Icon(Icons.logout_rounded, color: _neonRed, size: 22),
-            SizedBox(width: 10),
-            Text(
+            const SizedBox(width: 10),
+            const Text(
               "Konfirmasi Logout",
               style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ],
         ),
-        content: const Text(
+        content: Text(
           "Apakah kamu yakin ingin keluar dari sistem?",
           style: TextStyle(color: _dimText, fontSize: 13),
         ),
@@ -384,6 +401,7 @@ class _DashboardPageState extends State<DashboardPage> {
           _aiStatusMsg  = '✓ AI ($emotion): "$cleanAnswer"';
           _isAiProcessing = false;
         });
+        _saveChatToFirestore(question, cleanAnswer, emotion);
       } else {
         final errorBody = jsonDecode(response.body);
         final errMsg = errorBody['error']['message'] ?? 'Error ${response.statusCode}';
@@ -404,6 +422,750 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
+  // ── Simpan Log Telemetri ke Firestore dengan Throttling ─────────────────────
+  Future<void> _saveTelemetryToFirestore(int distance, int signal, String emotion) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final now = DateTime.now();
+    bool shouldSave = false;
+
+    if (_lastSavedTime == null || _lastSavedEmotion == null || _lastSavedDistance == null || _lastSavedSignal == null) {
+      shouldSave = true;
+    } else {
+      final timeDiff = now.difference(_lastSavedTime!);
+      final distDiff = (distance - _lastSavedDistance!).abs();
+      final sigDiff = (signal - _lastSavedSignal!).abs();
+
+      // Hanya simpan jika emosi berubah, jarak berubah >= 5 cm, sinyal berubah >= 8 dBm, atau sudah lewat 15 detik
+      if (emotion != _lastSavedEmotion || distDiff >= 5 || sigDiff >= 8 || timeDiff.inSeconds >= 15) {
+        shouldSave = true;
+      }
+    }
+
+    if (!shouldSave) return;
+
+    _lastSavedEmotion = emotion;
+    _lastSavedDistance = distance;
+    _lastSavedSignal = signal;
+    _lastSavedTime = now;
+
+    try {
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('activity_logs')
+          .add({
+        'type': 'telemetry',
+        'timestamp': FieldValue.serverTimestamp(),
+        'distance': distance,
+        'signal': signal,
+        'emotion': emotion,
+      });
+      debugPrint("Telemetri berhasil disimpan ke Firestore");
+    } catch (e) {
+      debugPrint("Gagal menyimpan telemetri ke Firestore: $e");
+    }
+  }
+
+  // ── Simpan Log Chat AI ke Firestore ────────────────────────────────────────
+  Future<void> _saveChatToFirestore(String question, String answer, String emotion) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    try {
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('activity_logs')
+          .add({
+        'type': 'chat',
+        'timestamp': FieldValue.serverTimestamp(),
+        'question': question,
+        'answer': answer,
+        'emotion': emotion,
+      });
+      debugPrint("Chat AI berhasil disimpan ke Firestore");
+    } catch (e) {
+      debugPrint("Gagal menyimpan Chat AI ke Firestore: $e");
+    }
+  }
+
+  // ── Helper: Item Menu Navigation Drawer ───────────────────────────────────
+  Widget _drawerItem({
+    required String label,
+    required IconData icon,
+    required Color iconColor,
+    Color textColor = Colors.white70,
+    required VoidCallback onTap,
+  }) {
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: ListTile(
+        onTap: onTap,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        leading: Icon(icon, color: iconColor, size: 20),
+        title: Text(
+          label,
+          style: TextStyle(
+            color: textColor,
+            fontWeight: FontWeight.w600,
+            fontSize: 13,
+            letterSpacing: 0.5,
+          ),
+        ),
+        trailing: const Icon(Icons.arrow_forward_ios_rounded, color: Colors.white24, size: 12),
+      ),
+    );
+  }
+
+  // ── Helper: Dialog Edit Profil (Nama & Foto/Avatar) ──────────────────────
+  void _showEditProfileDialog() {
+    final user = FirebaseAuth.instance.currentUser;
+    final nameController = TextEditingController(text: user?.displayName ?? "");
+    final photoController = TextEditingController(text: user?.photoURL ?? "");
+    File? selectedImageFile;
+    bool isUploading = false;
+
+    // 4 Robot Avatar Pilihan Cepat dari Dicebear API
+    final List<String> presetAvatars = [
+      "https://api.dicebear.com/7.x/bottts/png?seed=RoboZega",
+      "https://api.dicebear.com/7.x/bottts/png?seed=AlphaBot",
+      "https://api.dicebear.com/7.x/bottts/png?seed=CyberBot",
+      "https://api.dicebear.com/7.x/bottts/png?seed=NeonBot",
+    ];
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: _bgCard,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+                side: BorderSide(color: _neonBlue.withValues(alpha: 0.3), width: 1),
+              ),
+              title: Row(
+                children: [
+                  Icon(Icons.edit_rounded, color: _neonBlue, size: 22),
+                  const SizedBox(width: 10),
+                  Text(
+                    "Edit Profil",
+                    style: TextStyle(
+                      color: ThemeService.instance.isDark ? Colors.white : Colors.black87,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Preview Foto Profil dengan Tombol Pilih
+                    Center(
+                      child: Stack(
+                        children: [
+                          Container(
+                            width: 80,
+                            height: 80,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: _neonBlue, width: 2),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: _neonBlue.withValues(alpha: 0.25),
+                                  blurRadius: 10,
+                                ),
+                              ],
+                            ),
+                            child: CircleAvatar(
+                              backgroundColor: _bgDeep,
+                              backgroundImage: selectedImageFile != null
+                                  ? FileImage(selectedImageFile!) as ImageProvider
+                                  : (photoController.text.isNotEmpty
+                                      ? NetworkImage(photoController.text) as ImageProvider
+                                      : null),
+                              child: (selectedImageFile == null && photoController.text.isEmpty)
+                                  ? const Icon(Icons.person_rounded, color: Colors.white30, size: 40)
+                                  : null,
+                            ),
+                          ),
+                          if (!isUploading)
+                            Positioned(
+                              bottom: 0,
+                              right: 0,
+                              child: InkWell(
+                                onTap: () async {
+                                  final picker = ImagePicker();
+                                  final XFile? image = await picker.pickImage(
+                                    source: ImageSource.gallery,
+                                    maxWidth: 512,
+                                    maxHeight: 512,
+                                    imageQuality: 75,
+                                  );
+                                  if (image != null) {
+                                    setDialogState(() {
+                                      selectedImageFile = File(image.path);
+                                    });
+                                  }
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.all(6),
+                                  decoration: BoxDecoration(
+                                    color: _neonBlue,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(
+                                    Icons.camera_alt_rounded,
+                                    color: Colors.black,
+                                    size: 14,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Center(
+                      child: Text(
+                        selectedImageFile != null ? "Gambar dipilih dari galeri" : "Pilih foto profil kustom",
+                        style: TextStyle(color: _dimText, fontSize: 11),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+
+                    // Input Nama Tampilan
+                    Text(
+                      "NAMA TAMPILAN",
+                      style: TextStyle(color: _dimText, fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: nameController,
+                      enabled: !isUploading,
+                      style: TextStyle(
+                        color: ThemeService.instance.isDark ? Colors.white : Colors.black87,
+                        fontSize: 13,
+                      ),
+                      decoration: InputDecoration(
+                        filled: true,
+                        fillColor: _bgDeep,
+                        hintText: "Masukkan nama profil...",
+                        hintStyle: TextStyle(color: _dimText, fontSize: 13),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide(color: _neonBlue, width: 1),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 18),
+
+                    // Pilihan Cepat Avatar
+                    Text(
+                      "PILIH AVATAR CEPAT",
+                      style: TextStyle(color: _dimText, fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: presetAvatars.map((url) {
+                        final isSelected = selectedImageFile == null && photoController.text == url;
+                        return InkWell(
+                          onTap: isUploading
+                              ? null
+                              : () {
+                                  setDialogState(() {
+                                    photoController.text = url;
+                                    selectedImageFile = null;
+                                  });
+                                },
+                          borderRadius: BorderRadius.circular(10),
+                          child: Container(
+                            width: 52,
+                            height: 52,
+                            padding: const EdgeInsets.all(2),
+                            decoration: BoxDecoration(
+                              color: _bgDeep,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: isSelected ? _neonBlue : Colors.transparent,
+                                width: 2,
+                              ),
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: Image.network(
+                                url,
+                                fit: BoxFit.cover,
+                                errorBuilder: (context, error, stackTrace) => const Icon(
+                                  Icons.smart_toy_rounded,
+                                  color: Colors.white30,
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+
+                    if (isUploading) ...[
+                      const SizedBox(height: 16),
+                      Center(
+                        child: Column(
+                          children: [
+                            SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: CircularProgressIndicator(color: _neonBlue, strokeWidth: 2.5),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              "Mengunggah foto profil...",
+                              style: TextStyle(color: _neonBlue, fontSize: 11, fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: isUploading
+                  ? []
+                  : [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        style: TextButton.styleFrom(foregroundColor: _dimText),
+                        child: const Text("Batal"),
+                      ),
+                      ElevatedButton(
+                        onPressed: () async {
+                          if (user != null) {
+                            setDialogState(() {
+                              isUploading = true;
+                            });
+                            try {
+                              String? finalPhotoUrl = photoController.text.trim();
+
+                              if (selectedImageFile != null) {
+                                final storageRef = FirebaseStorage.instance
+                                    .ref()
+                                    .child('users/${user.uid}/profile.jpg');
+                                await storageRef.putFile(selectedImageFile!);
+                                finalPhotoUrl = await storageRef.getDownloadURL();
+                              }
+
+                              await user.updateDisplayName(nameController.text.trim());
+                              if (finalPhotoUrl.isNotEmpty) {
+                                await user.updatePhotoURL(finalPhotoUrl);
+                              }
+                              await user.reload();
+
+                              setState(() {}); // Refresh dashboard
+
+                              if (ctx.mounted) {
+                                Navigator.pop(ctx);
+                                _showSnackBar("✓ Profil berhasil diperbarui!", _neonGreen);
+                              }
+                            } catch (e) {
+                              if (ctx.mounted) {
+                                setDialogState(() {
+                                  isUploading = false;
+                                });
+                                _showSnackBar("✗ Gagal memperbarui profil: $e", _neonRed);
+                              }
+                            }
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _neonBlue.withValues(alpha: 0.15),
+                          foregroundColor: _neonBlue,
+                          side: BorderSide(color: _neonBlue.withValues(alpha: 0.4)),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          elevation: 0,
+                        ),
+                        child: const Text("Simpan", style: TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ── Helper: Widget Navigation Drawer (Drawer Kiri) ───────────────────────
+  Widget _buildDrawer() {
+    final user = FirebaseAuth.instance.currentUser;
+    final String displayName = user?.displayName ?? "Pengguna MiniBot";
+    final String email = user?.email ?? "";
+    final String? photoUrl = user?.photoURL;
+
+    return ListenableBuilder(
+      listenable: ThemeService.instance,
+      builder: (context, _) {
+        return Drawer(
+          backgroundColor: _bgDeep,
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.only(
+              topRight: Radius.circular(20),
+              bottomRight: Radius.circular(20),
+            ),
+          ),
+          child: SafeArea(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Header Profil
+                Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: _bgCard,
+                    border: Border(
+                      bottom: BorderSide(color: _neonBlue.withValues(alpha: 0.3), width: 1),
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          // Avatar
+                          Container(
+                            width: 60,
+                            height: 60,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: _neonBlue, width: 2),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: _neonBlue.withValues(alpha: 0.3),
+                                  blurRadius: 10,
+                                ),
+                              ],
+                            ),
+                            child: CircleAvatar(
+                              backgroundColor: _bgButton,
+                              backgroundImage: (photoUrl != null && photoUrl.isNotEmpty)
+                                  ? NetworkImage(photoUrl)
+                                  : null,
+                              child: (photoUrl == null || photoUrl.isEmpty)
+                                  ? const Icon(Icons.person_rounded, color: Colors.white, size: 30)
+                                  : null,
+                            ),
+                          ),
+                          const SizedBox(width: 14),
+                          // Info Teks
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  displayName,
+                                  style: TextStyle(
+                                    color: ThemeService.instance.isDark ? Colors.white : Colors.black87,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  email,
+                                  style: const TextStyle(
+                                    color: Colors.grey,
+                                    fontSize: 12,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 10),
+
+                // Item Menu
+                Expanded(
+                  child: ListView(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    children: [
+                      _drawerItem(
+                        label: "Edit Profil",
+                        icon: Icons.edit_rounded,
+                        iconColor: _neonBlue,
+                        textColor: ThemeService.instance.isDark ? Colors.white70 : Colors.black87,
+                        onTap: () {
+                          Navigator.pop(context); // Tutup drawer
+                          _showEditProfileDialog();
+                        },
+                      ),
+                      _drawerItem(
+                        label: "Histori Aktivitas",
+                        icon: Icons.history_rounded,
+                        iconColor: _neonGreen,
+                        textColor: ThemeService.instance.isDark ? Colors.white70 : Colors.black87,
+                        onTap: () {
+                          Navigator.pop(context); // Tutup drawer
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const HistoryPage()),
+                          );
+                        },
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        child: Divider(color: Colors.white10),
+                      ),
+
+                      // PENGATURAN TEMA
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        child: Text(
+                          "PENGATURAN TEMA",
+                          style: TextStyle(
+                            color: Colors.grey,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                      ),
+
+                      // Light / Dark Mode Switcher
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: _bgButton,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: _dimText.withValues(alpha: 0.15)),
+                          ),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: InkWell(
+                                  onTap: () => ThemeService.instance.setThemeMode(ThemeMode.light),
+                                  borderRadius: const BorderRadius.only(
+                                    topLeft: Radius.circular(9),
+                                    bottomLeft: Radius.circular(9),
+                                  ),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(vertical: 8),
+                                    decoration: BoxDecoration(
+                                      color: !ThemeService.instance.isDark
+                                          ? _neonBlue.withValues(alpha: 0.15)
+                                          : Colors.transparent,
+                                      borderRadius: const BorderRadius.only(
+                                        topLeft: Radius.circular(9),
+                                        bottomLeft: Radius.circular(9),
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(
+                                          Icons.light_mode_rounded,
+                                          size: 14,
+                                          color: !ThemeService.instance.isDark ? _neonBlue : _dimText,
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          "Terang",
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold,
+                                            color: !ThemeService.instance.isDark
+                                                ? (ThemeService.instance.isDark ? Colors.white : Colors.black87)
+                                                : _dimText,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              Container(
+                                width: 1,
+                                height: 18,
+                                color: _dimText.withValues(alpha: 0.2),
+                              ),
+                              Expanded(
+                                child: InkWell(
+                                  onTap: () => ThemeService.instance.setThemeMode(ThemeMode.dark),
+                                  borderRadius: const BorderRadius.only(
+                                    topRight: Radius.circular(9),
+                                    bottomRight: Radius.circular(9),
+                                  ),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(vertical: 8),
+                                    decoration: BoxDecoration(
+                                      color: ThemeService.instance.isDark
+                                          ? _neonBlue.withValues(alpha: 0.15)
+                                          : Colors.transparent,
+                                      borderRadius: const BorderRadius.only(
+                                        topRight: Radius.circular(9),
+                                        bottomRight: Radius.circular(9),
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(
+                                          Icons.dark_mode_rounded,
+                                          size: 14,
+                                          color: ThemeService.instance.isDark ? _neonBlue : _dimText,
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          "Gelap",
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold,
+                                            color: ThemeService.instance.isDark
+                                                ? Colors.white
+                                                : _dimText,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+
+                      const SizedBox(height: 8),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        child: Text(
+                          "KOMBINASI WARNA NEON",
+                          style: TextStyle(
+                            color: Colors.grey,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                      ),
+
+                      // Color presets Wrap
+                      ...ThemeService.colorPresets.map((preset) {
+                        final isSelected = ThemeService.instance.primaryColor.value == preset.primary.value;
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                          child: InkWell(
+                            onTap: () => ThemeService.instance.setColorTheme(preset.primary, preset.accent),
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? preset.primary.withValues(alpha: 0.08)
+                                    : _bgCard,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: isSelected
+                                      ? preset.primary
+                                      : _dimText.withValues(alpha: 0.15),
+                                  width: 1,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Container(
+                                    width: 16,
+                                    height: 16,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      gradient: LinearGradient(
+                                        colors: [preset.primary, preset.accent],
+                                        begin: Alignment.centerLeft,
+                                        end: Alignment.centerRight,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      preset.name,
+                                      style: TextStyle(
+                                        color: isSelected
+                                            ? (ThemeService.instance.isDark ? Colors.white : Colors.black87)
+                                            : _dimText,
+                                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ),
+                                  if (isSelected)
+                                    Icon(Icons.check_circle_rounded, color: preset.primary, size: 14),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      }),
+
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        child: Divider(color: Colors.white10),
+                      ),
+                      _drawerItem(
+                        label: "Keluar (Logout)",
+                        icon: Icons.logout_rounded,
+                        iconColor: _neonRed,
+                        textColor: _neonRed,
+                        onTap: () {
+                          Navigator.pop(context); // Tutup drawer
+                          _handleLogout();
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+
+                // Footer
+                Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Text(
+                    "MiniBot App v1.2.0",
+                    style: TextStyle(
+                      color: _dimText.withValues(alpha: 0.5),
+                      fontSize: 10,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   void dispose() {
     _speech.cancel();
@@ -416,123 +1178,132 @@ class _DashboardPageState extends State<DashboardPage> {
   // ═══════════════════════════════════════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
-    final emotionColor = _getEmotionColor(_currentEmotion);
-    final signalColor  = _getSignalColor(_currentSignal);
-    final signalStatus = _getSignalStatus(_currentSignal);
+    return ListenableBuilder(
+      listenable: ThemeService.instance,
+      builder: (context, _) {
+        final emotionColor = _getEmotionColor(_currentEmotion);
+        final signalColor  = _getSignalColor(_currentSignal);
+        final signalStatus = _getSignalStatus(_currentSignal);
 
-    return Scaffold(
-      backgroundColor: _bgDeep,
-      appBar: AppBar(
-        backgroundColor: _bgCard,
-        centerTitle: true,
-        elevation: 0,
-        title: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.developer_board_rounded, color: _neonBlue, size: 20),
-            const SizedBox(width: 8),
-            const Text(
-              "MINIBOT TRKJ",
-              style: TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 2,
-                fontSize: 16,
+        return Scaffold(
+          backgroundColor: _bgDeep,
+          appBar: AppBar(
+            backgroundColor: _bgCard,
+            centerTitle: true,
+            elevation: 0,
+            leading: Builder(
+              builder: (context) => IconButton(
+                onPressed: () => Scaffold.of(context).openDrawer(),
+                icon: Icon(
+                  Icons.menu_rounded,
+                  color: ThemeService.instance.isDark ? Colors.white : Colors.black87,
+                  size: 24,
+                ),
+                tooltip: 'Menu Utama',
               ),
             ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            onPressed: _handleLogout,
-            icon: const Icon(Icons.logout_rounded, color: _neonRed, size: 22),
-            tooltip: 'Logout',
-          ),
-          const SizedBox(width: 4),
-        ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(1),
-          child: Container(
-            height: 1,
-            color: _neonBlue.withValues(alpha: 0.3),
-          ),
-        ),
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-
-            // ── 1. MQTT STATUS CARD ────────────────────────────────────────
-            _mqttStatusCard(),
-            const SizedBox(height: 24),
-
-            // ── 2. CURRENT EMOTION CARD ───────────────────────────────────
-            _sectionLabel("EMOSI ROBOT SAAT INI"),
-            const SizedBox(height: 10),
-            _emotionCard(emotionColor),
-            const SizedBox(height: 24),
-
-            // ── 3. REAL-TIME HARDWARE MONITORING ─────────────────────────
-            _sectionLabel("REAL-TIME HARDWARE MONITORING"),
-            const SizedBox(height: 10),
-            Row(
+            title: Row(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Expanded(
-                  child: _telemetryCard(
-                    label:     "Jarak Sensor",
-                    value:     "$_currentDistance",
-                    unit:      "cm",
-                    icon:      Icons.radar_rounded,
-                    glowColor: _neonBlue,
-                  ),
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: _telemetryCard(
-                    label:     "Kekuatan Sinyal",
-                    value:     "$_currentSignal",
-                    unit:      "dBm",
-                    icon:      Icons.wifi_rounded,
-                    glowColor: signalColor,
-                    subtitle:  signalStatus,
+                Icon(Icons.developer_board_rounded, color: _neonBlue, size: 20),
+                const SizedBox(width: 8),
+                Text(
+                  "MINIBOT TRKJ",
+                  style: TextStyle(
+                    color: ThemeService.instance.isDark ? Colors.white : Colors.black87,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 2,
+                    fontSize: 16,
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 28),
-
-            // ── 4. AI VOICE CHAT STATUS CARD ─────────────────────────────
-            _sectionLabel("AI VOICE CHAT → OLED"),
-            const SizedBox(height: 10),
-            _aiVoiceChatCard(),
-            const SizedBox(height: 28),
-
-            // ── 5. MANUAL OVERRIDE CONTROL ────────────────────────────────
-            _sectionLabel("MANUAL OVERRIDE CONTROL"),
-            const SizedBox(height: 10),
-            GridView.count(
-              crossAxisCount: 2,
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              crossAxisSpacing: 14,
-              mainAxisSpacing: 14,
-              childAspectRatio: 1.4,
+            bottom: PreferredSize(
+              preferredSize: const Size.fromHeight(1),
+              child: Container(
+                height: 1,
+                color: _neonBlue.withValues(alpha: 0.3),
+              ),
+            ),
+          ),
+          body: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _overrideBtn("HAPPY",  Icons.sentiment_very_satisfied_rounded,   _neonGreen,  "happy"),
-                _overrideBtn("SAD",    Icons.sentiment_very_dissatisfied_rounded, _neonBlue,   "sad"),
-                _overrideBtn("SCARED", Icons.gpp_bad_rounded,                    _neonRed,    "scared"),
-                _overrideBtn("NORMAL", Icons.smart_toy_rounded,                  _neonYellow, "normal"),
+
+                // ── 1. MQTT STATUS CARD ────────────────────────────────────────
+                _mqttStatusCard(),
+                const SizedBox(height: 24),
+
+                // ── 2. CURRENT EMOTION CARD ───────────────────────────────────
+                _sectionLabel("EMOSI ROBOT SAAT INI"),
+                const SizedBox(height: 10),
+                _emotionCard(emotionColor),
+                const SizedBox(height: 24),
+
+                // ── 3. REAL-TIME HARDWARE MONITORING ─────────────────────────
+                _sectionLabel("REAL-TIME HARDWARE MONITORING"),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _telemetryCard(
+                        label:     "Jarak Sensor",
+                        value:     "$_currentDistance",
+                        unit:      "cm",
+                        icon:      Icons.radar_rounded,
+                        glowColor: _neonBlue,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: _telemetryCard(
+                        label:     "Kekuatan Sinyal",
+                        value:     "$_currentSignal",
+                        unit:      "dBm",
+                        icon:      Icons.wifi_rounded,
+                        glowColor: signalColor,
+                        subtitle:  signalStatus,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 28),
+
+                // ── 4. AI VOICE CHAT STATUS CARD ─────────────────────────────
+                _sectionLabel("AI VOICE CHAT → OLED"),
+                const SizedBox(height: 10),
+                _aiVoiceChatCard(),
+                const SizedBox(height: 28),
+
+                // ── 5. MANUAL OVERRIDE CONTROL ────────────────────────────────
+                _sectionLabel("MANUAL OVERRIDE CONTROL"),
+                const SizedBox(height: 10),
+                GridView.count(
+                  crossAxisCount: 2,
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  crossAxisSpacing: 14,
+                  mainAxisSpacing: 14,
+                  childAspectRatio: 1.4,
+                  children: [
+                    _overrideBtn("HAPPY",  Icons.sentiment_very_satisfied_rounded,   _neonGreen,  "happy"),
+                    _overrideBtn("SAD",    Icons.sentiment_very_dissatisfied_rounded, _neonBlue,   "sad"),
+                    _overrideBtn("SCARED", Icons.gpp_bad_rounded,                    _neonRed,    "scared"),
+                    _overrideBtn("NORMAL", Icons.smart_toy_rounded,                  _neonYellow, "normal"),
+                  ],
+                ),
+
+                const SizedBox(height: 90), // ruang untuk FAB
               ],
             ),
-
-            const SizedBox(height: 90), // ruang untuk FAB
-          ],
-        ),
-      ),
-      // ── FAB MIC BUTTON ─────────────────────────────────────────────────────
-      floatingActionButton: _micFab(),
+          ),
+          drawer: _buildDrawer(),
+          // ── FAB MIC BUTTON ─────────────────────────────────────────────────────
+          floatingActionButton: _micFab(),
+        );
+      },
     );
   }
 
@@ -573,7 +1344,7 @@ class _DashboardPageState extends State<DashboardPage> {
               if (_isListening)
                 _pulseIcon(Icons.mic_rounded, _neonRed)
               else if (_isAiProcessing)
-                const SizedBox(
+                SizedBox(
                   width: 22,
                   height: 22,
                   child: CircularProgressIndicator(
@@ -608,13 +1379,13 @@ class _DashboardPageState extends State<DashboardPage> {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.record_voice_over_rounded,
+                  Icon(Icons.record_voice_over_rounded,
                       color: _neonBlue, size: 14),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       '"$_voiceInputText"',
-                      style: const TextStyle(
+                      style: TextStyle(
                         color: _neonBlue,
                         fontSize: 12,
                         fontStyle: FontStyle.italic,
@@ -637,14 +1408,14 @@ class _DashboardPageState extends State<DashboardPage> {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.monitor_rounded,
+                  Icon(Icons.monitor_rounded,
                       color: _neonGreen, size: 14),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
+                        Text(
                           'OLED OUTPUT:',
                           style: TextStyle(
                             color: _dimText,
@@ -656,7 +1427,7 @@ class _DashboardPageState extends State<DashboardPage> {
                         const SizedBox(height: 2),
                         Text(
                           'msg:$_lastAiAnswer',
-                          style: const TextStyle(
+                          style: TextStyle(
                             color: _neonGreen,
                             fontSize: 13,
                             fontWeight: FontWeight.w800,
@@ -720,7 +1491,7 @@ class _DashboardPageState extends State<DashboardPage> {
         ),
         tooltip: 'Bicara ke MiniBot AI',
         child: _isAiProcessing
-            ? const SizedBox(
+            ? SizedBox(
                 width: 22,
                 height: 22,
                 child: CircularProgressIndicator(
@@ -750,7 +1521,7 @@ class _DashboardPageState extends State<DashboardPage> {
         const SizedBox(width: 8),
         Text(
           text,
-          style: const TextStyle(
+          style: TextStyle(
             color: _dimText,
             fontSize: 11,
             fontWeight: FontWeight.w700,
@@ -801,7 +1572,7 @@ class _DashboardPageState extends State<DashboardPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
+                Text(
                   "MQTT BROKER",
                   style: TextStyle(
                     color: _dimText,
@@ -870,7 +1641,7 @@ class _DashboardPageState extends State<DashboardPage> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
+              Text(
                 "Status Aktif",
                 style: TextStyle(
                   color: _dimText,
@@ -886,12 +1657,6 @@ class _DashboardPageState extends State<DashboardPage> {
                   fontSize: 28,
                   fontWeight: FontWeight.w900,
                   letterSpacing: 3,
-                  shadows: [
-                    Shadow(
-                      color: emotionColor.withValues(alpha: 0.8),
-                      blurRadius: 12,
-                    ),
-                  ],
                 ),
               ),
             ],
@@ -933,7 +1698,7 @@ class _DashboardPageState extends State<DashboardPage> {
               Expanded(
                 child: Text(
                   label,
-                  style: const TextStyle(
+                  style: TextStyle(
                     color: _dimText,
                     fontSize: 10,
                     letterSpacing: 1.2,
@@ -955,12 +1720,6 @@ class _DashboardPageState extends State<DashboardPage> {
                   fontSize: 32,
                   fontWeight: FontWeight.w900,
                   fontFamily: 'monospace',
-                  shadows: [
-                    Shadow(
-                      color: glowColor.withValues(alpha: 0.7),
-                      blurRadius: 10,
-                    ),
-                  ],
                 ),
               ),
               const SizedBox(width: 4),

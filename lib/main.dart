@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'auth/login_screen.dart';
 import 'firebase_options.dart';
 import 'pages/dashboard_page.dart';
+import 'theme/theme_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,15 +19,49 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'MiniBot TRKJ',
-      theme: ThemeData(
-        brightness:   Brightness.dark,
-        primaryColor: const Color(0xFF00D4FF),
-        useMaterial3: true,
-      ),
-      home: const AuthWrapper(),
+    return ListenableBuilder(
+      listenable: ThemeService.instance,
+      builder: (context, _) {
+        final primaryColor = ThemeService.instance.primaryColor;
+        final themeMode = ThemeService.instance.themeMode;
+
+        return MaterialApp(
+          debugShowCheckedModeBanner: false,
+          title: 'MiniBot TRKJ',
+          themeMode: themeMode,
+          theme: ThemeData(
+            brightness: Brightness.light,
+            primaryColor: primaryColor,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: primaryColor,
+              brightness: Brightness.light,
+            ),
+            useMaterial3: true,
+            scaffoldBackgroundColor: const Color(0xFFF4F5F9),
+            appBarTheme: const AppBarTheme(
+              backgroundColor: Colors.white,
+              foregroundColor: Colors.black87,
+              elevation: 0,
+            ),
+          ),
+          darkTheme: ThemeData(
+            brightness: Brightness.dark,
+            primaryColor: primaryColor,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: primaryColor,
+              brightness: Brightness.dark,
+            ),
+            useMaterial3: true,
+            scaffoldBackgroundColor: const Color(0xFF0D0E15),
+            appBarTheme: const AppBarTheme(
+              backgroundColor: Color(0xFF12131E),
+              foregroundColor: Colors.white,
+              elevation: 0,
+            ),
+          ),
+          home: const AuthWrapper(),
+        );
+      },
     );
   }
 }
